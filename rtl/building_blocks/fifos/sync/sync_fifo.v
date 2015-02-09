@@ -35,7 +35,7 @@
  *   along with this source file.  If not, see <http://www.gnu.org/licenses/>.
  *
  *
- *  Module name: sync_fifo_simple
+ *  Module name: sync_fifo
  *
  */
 
@@ -249,7 +249,7 @@ sync_fifo_reg_stage #(.DWIDTH(DATASIZE))
         .d_out(d_out_3)
     );
 
-ram #(
+hmc_ram #(
     .DATASIZE(DATASIZE),    // Memory data word width
     .ADDRSIZE(ADDRSIZE),    // Number of memory address bits
     .PIPELINED(1)

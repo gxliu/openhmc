@@ -45,11 +45,11 @@ module rx_link #(
     parameter LOG_FPW           = 2,
     parameter FPW               = 4,
     parameter DWIDTH            = 512,
-    parameter LOG_HMC_NUM_LANES = 3,
-    parameter HMC_NUM_LANES     = 8,
+    parameter LOG_NUM_LANES     = 3,
+    parameter NUM_LANES         = 8,
     parameter LOG_MAX_RTC       = 8,
     parameter HMC_PTR_SIZE      = 8,
-    parameter HMC_RF_WWIDTH     = 64
+    parameter HMC_RF_RWIDTH     = 64
 ) (
 
     //----------------------------------
@@ -62,7 +62,7 @@ module rx_link #(
     //----TO HMC PHY
     //----------------------------------
     input   wire    [DWIDTH-1:0]        phy_scrambled_data_in,
-    output  reg     [HMC_NUM_LANES-1:0] init_bit_slip,               //bit slip per lane
+    output  reg     [NUM_LANES-1:0]     init_bit_slip,               //bit slip per lane
 
     //----------------------------------
     //----TO RX HTAX FIFO
@@ -89,24 +89,24 @@ module rx_link #(
     //----RF
     //----------------------------------
     //Monitoring    1-cycle set to increment
-    output  reg     [HMC_RF_WWIDTH-1:0] rf_cnt_poisoned,
-    output  reg     [HMC_RF_WWIDTH-1:0] rf_cnt_rsp,
+    output  reg     [HMC_RF_RWIDTH-1:0] rf_cnt_poisoned,
+    output  reg     [HMC_RF_RWIDTH-1:0] rf_cnt_rsp,
     //Status
     output  reg     [1:0]               rf_link_status,
     output  reg     [2:0]               rf_hmc_init_status,
     input   wire                        rf_tx_sends_ts1,
     input   wire                        rf_hmc_sleep,
     //Init Status
-    output  wire    [HMC_NUM_LANES-1:0] rf_descrambler_part_aligned,
-    output  wire    [HMC_NUM_LANES-1:0] rf_descrambler_aligned,
+    output  wire    [NUM_LANES-1:0]     rf_descrambler_part_aligned,
+    output  wire    [NUM_LANES-1:0]     rf_descrambler_aligned,
     output  wire                        rf_all_descramblers_aligned,
     //Control
-    input   wire    [9:0]               rf_rx_buffer_rtc,
     input   wire    [7:0]               rf_bit_slip_time,
-    output  reg     [HMC_NUM_LANES-1:0] rf_lane_polarity,
+    input   wire                        rf_hmc_init_cont_set,
+    output  reg     [NUM_LANES-1:0]     rf_lane_polarity,
     input   wire                        rf_scrambler_disable,
     output  reg                         rf_lane_reversal_detected,
-    output  reg     [HMC_NUM_LANES-1:0] rf_descramblers_locked,
+    output  reg     [NUM_LANES-1:0]     rf_descramblers_locked,
     input   wire    [4:0]               rf_irtry_received_threshold
 
 );
@@ -120,10 +120,10 @@ module rx_link #(
 
 //------------------------------------------------------------------------------------Some general things
 //Link state
-localparam              HMC_DOWN         = 3'b000;
-localparam              HMC_NULL         = 3'b001;
-localparam              HMC_TS1          = 3'b010;
-localparam              HMC_UP           = 3'b100;
+localparam              HMC_DOWN        = 3'b000;
+localparam              HMC_NULL        = 3'b001;
+localparam              HMC_TS1         = 3'b010;
+localparam              HMC_UP          = 3'b100;
 
 //Commands
 localparam              CMD_NULL        = 3'b000;
@@ -135,7 +135,7 @@ localparam              CMD_FLOW        = 3'b000;
 localparam              CMD_RSP         = 3'b111;
 
 //Other helpful defines
-localparam              WIDTH_PER_LANE          = (DWIDTH/HMC_NUM_LANES);
+localparam              WIDTH_PER_LANE          = (DWIDTH/NUM_LANES);
 
 //16 bits is a ts1, so the init seq number is incremented according to the lane size
 localparam              INIT_SEQ_INC_PER_CYCLE  = WIDTH_PER_LANE/16;
@@ -144,83 +144,94 @@ localparam              INIT_SEQ_INC_PER_CYCLE  = WIDTH_PER_LANE/16;
 integer i_f;    //counts to FPW
 integer i_c;    //counts to CYCLES_TO_COMPLETE_FULL_PACKET
 
-genvar f;   //Counts until FPW
-genvar n;   //Counts until HMC_NUM_LANES
-genvar w;   //Counts until WIDTH_PER_LANE
+genvar f;   //Counts to FPW
+genvar n;   //Counts to NUM_LANES
+genvar w;   //Counts to WIDTH_PER_LANE
 
 //------------------------------------------------------------------------------------DESCRAMBLER AND DATA ORDERING
-reg [HMC_NUM_LANES-1:0]     descrambler_part_aligned;
-reg [HMC_NUM_LANES-1:0]     descrambler_aligned;
-assign                      rf_descrambler_part_aligned = descrambler_part_aligned;
-assign                      rf_descrambler_aligned      = descrambler_aligned;
+reg [NUM_LANES-1:0]     descrambler_part_aligned;
+reg [NUM_LANES-1:0]     descrambler_aligned;
+assign                  rf_descrambler_part_aligned = descrambler_part_aligned;
+assign                  rf_descrambler_aligned      = descrambler_aligned;
 
-//DATA and REORDERING: Pipeline d_in for timing closure
-wire [WIDTH_PER_LANE-1:0]   descrambled_data_on_lane    [HMC_NUM_LANES-1:0];
-reg  [DWIDTH-1:0]           d_in;
-reg  [DWIDTH-1:0]           d_in_init;
-wire [DWIDTH-1:0]           d_in_temp;
+//DATA and REORDERING
+wire [WIDTH_PER_LANE-1:0]   descrambled_data_on_lane    [NUM_LANES-1:0];
+wire  [DWIDTH-1:0]          d_in;
 wire [128-1:0]              d_in_flit                   [FPW-1:0];
-wire [128-1:0]              d_in_flit_init              [FPW-1:0];
 
 //Valid FLIT sources. A FLIT is valid when the command is not zero
 wire [FPW-1:0]              valid_flit_src;     //bit0 = flit0, ...
-wire [FPW-1:0]              valid_flit_src_init;     //bit0 = flit0, ...
 
 generate
 
     //-- Apply lane reversal if detected
-    for(n = 0; n < HMC_NUM_LANES; n = n + 1) begin : apply_lane_reversal
+    for(n = 0; n < NUM_LANES; n = n + 1) begin : apply_lane_reversal
         for(w = 0; w < WIDTH_PER_LANE; w = w + 1) begin
-            assign d_in_temp[w*HMC_NUM_LANES+n] = rf_lane_reversal_detected ? descrambled_data_on_lane[HMC_NUM_LANES-1-n][w] : descrambled_data_on_lane[n][w];
+            assign d_in[w*NUM_LANES+n] = rf_lane_reversal_detected ? descrambled_data_on_lane[NUM_LANES-1-n][w] : descrambled_data_on_lane[n][w];
         end
     end
 
 
     for(f = 0; f < FPW; f = f + 1) begin : reorder_input_data
-        //-- Reorder the descrambled data for the init sequence
-        assign d_in_flit_init[f] = d_in_init[128-1+(f*128):f*128];
         //-- Reorder the descrambled data to FLITs
-        assign d_in_flit[f]      = d_in[128-1+(f*128):f*128];
+        assign d_in_flit[f]       = d_in[128-1+(f*128):f*128];
         //-- Generate valid flit positions for the init sequence
-        assign valid_flit_src_init[f]   =   (d_in_flit_init[f] == 0) ? 1'b0 : 1'b1;
-        //-- Generate valid flit positions for the init sequence
-        assign valid_flit_src[f]        =   (cmd(d_in_flit[f]) == 0) ? 1'b0 : 1'b1;
+        assign valid_flit_src[f]  = (d_in_flit[f] == 0) ? 1'b0 : 1'b1;
     end
 
 endgenerate
 
 
 //------------------------------------------------------------------------------------INIT
-localparam                      LINK_DOWN   = 2'b00;
-localparam                      LINK_INIT   = 2'b01;
-localparam                      LINK_UP     = 2'b10;
+localparam                  LINK_DOWN   = 2'b00;
+localparam                  LINK_INIT   = 2'b01;
+localparam                  LINK_UP     = 2'b10;
 
-reg     [7:0]                   init_bit_slip_cnt;
-reg     [4:0]                   init_wait_time;
-wire    [HMC_NUM_LANES-1:0]     init_descrambler_locked;           //locked from the descrambler
-wire                            link_is_up;
-reg     [3:0]                   init_tmp_seq;
+reg     [7:0]               init_bit_slip_cnt;
+reg     [4:0]               init_wait_time;
+wire    [NUM_LANES-1:0]     init_descrambler_locked;           //locked from the descrambler
+wire                        link_is_up;
+reg     [3:0]               init_tmp_seq;
 
-assign                          link_is_up                  = rf_link_status[1];
-assign                          rf_all_descramblers_aligned = descrambler_aligned == {HMC_NUM_LANES{1'b1}} ? 1'b1 : 1'b0;
+assign                      link_is_up                  = rf_link_status[1];
+assign                      rf_all_descramblers_aligned = &descrambler_aligned;
 
 //--------------TS1 recognition
-localparam                      ts1_independent_portion = {4'hF,4'h0};
-localparam                      ts1_lane7or15_portion   = 4'hc;
+localparam                  ts1_independent_portion = {4'hF,4'h0};
+localparam                  ts1_lanex_portion       = {4'h5};
+localparam                  ts1_lane7or15_portion   = 4'hc;
+localparam                  ts1_lane0_portion       = 4'h3;
 
-wire    [HMC_NUM_LANES-1:0]     init_lane_has_correct_ts1;
+localparam                  ts1_per_cycle_and_lane = DWIDTH/NUM_LANES/16;
 
+wire    [NUM_LANES-1:0]     init_lane_has_correct_ts1;
+wire    [ts1_per_cycle_and_lane-1:0]     init_lane_has_correct_ts1_vec   [NUM_LANES-1:0];
+
+genvar t;
 generate
-    for(n=0;n<HMC_NUM_LANES;n=n+1)begin : lane_has_correct_ts1_gen
-        assign init_lane_has_correct_ts1[n] = (descrambled_data_on_lane[n][15:8] == ts1_independent_portion) ? 1'b1 : 1'b0;
+    //Make sure that the lanes have valid ts1 sequences throughout the entire data stream
+    for(n=0;n<NUM_LANES;n=n+1) begin : lane_has_correct_ts1_gen
+
+        assign init_lane_has_correct_ts1[n] = &init_lane_has_correct_ts1_vec[n];
+
+        for(t=0;t<ts1_per_cycle_and_lane;t=t+1) begin
+            if(n==0 || n==NUM_LANES-1) begin
+                assign init_lane_has_correct_ts1_vec[n][t] = (descrambled_data_on_lane[n][(t*16)+16-1:(t*16)+4] == {ts1_independent_portion,ts1_lane7or15_portion})
+                                                             ||
+                                                             (descrambled_data_on_lane[n][(t*16)+16-1:(t*16)+4] == {ts1_independent_portion,ts1_lane0_portion});            
+            end else begin
+                assign init_lane_has_correct_ts1_vec[n][t] = (descrambled_data_on_lane[n][(t*16)+16-1:(t*16)+4] == {ts1_independent_portion,ts1_lanex_portion});
+            end
+        end
     end
 endgenerate
 
 //--------------Align the lanes, scan for the ts1 seq
-reg  [LOG_HMC_NUM_LANES-1:0]    init_lane_cnt;
-wire [3:0]                      init_seq_diff;
+reg  [LOG_NUM_LANES-1:0]    init_lane_cnt;
+wire [3:0]                  init_seq_diff;
 
-assign                          init_seq_diff = |descrambler_part_aligned ? (descrambled_data_on_lane[init_lane_cnt][3:0] - init_tmp_seq) : 0;
+//If one of the descramblers is already partially aligned search for other lanes with their ts1 sequence number close this lane. 
+assign                      init_seq_diff = |descrambler_part_aligned ? (descrambled_data_on_lane[init_lane_cnt][3:0] - init_tmp_seq) : 0;
 
 //------------------------------------------------------------------------------------Input Stage: Scan for Packets, Headers, Tails ...
 reg  [DWIDTH-1:0]       data2crc;
@@ -359,7 +370,7 @@ generate
         end
 endgenerate
 
-//------------------------------------------------------------------------------------Input Buffer
+//------------------------------------------------------------------------------------Counter
 reg [LOG_FPW:0] rf_cnt_poisoned_comb;
 reg [LOG_FPW:0] rf_cnt_rsp_comb;
 
@@ -406,64 +417,66 @@ reg         irtry_clear_trig_comb;
 //========================================================================================================================================
 //------------------------------------------------------------------INIT
 //========================================================================================================================================
+
 `ifdef ASYNC_RES
 always @(posedge clk or negedge res_n)  begin `else
 always @(posedge clk)  begin `endif
 
 if(!res_n) begin
     //----Misc
-    descrambler_aligned         <= {HMC_NUM_LANES{1'b0}};
-    descrambler_part_aligned    <= {HMC_NUM_LANES{1'b0}};
-    init_bit_slip               <= {HMC_NUM_LANES{1'b0}};
+    descrambler_aligned         <= {NUM_LANES{1'b0}};
+    descrambler_part_aligned    <= {NUM_LANES{1'b0}};
+    init_bit_slip               <= {NUM_LANES{1'b0}};
     init_bit_slip_cnt           <= {8{1'b0}};
-    init_wait_time              <= {5{1'b0}};
+    init_wait_time              <= 5'h0;
     rf_hmc_init_status          <= HMC_DOWN;
     rf_link_status              <= LINK_DOWN;
-    rf_lane_polarity            <= {HMC_NUM_LANES{1'b0}};
+    rf_lane_polarity            <= {NUM_LANES{1'b0}};
     rf_lane_reversal_detected   <= 1'b0;
-    rf_descramblers_locked      <= {HMC_NUM_LANES{1'b0}};
+    rf_descramblers_locked      <= {NUM_LANES{1'b0}};
 
     init_tmp_seq                <= 4'h0;
-    init_lane_cnt                    <= {LOG_HMC_NUM_LANES{1'b0}};
+    init_lane_cnt               <= {LOG_NUM_LANES{1'b0}};
 end
 else begin
 
     rf_descramblers_locked  <= init_descrambler_locked;
-    init_bit_slip           <= {HMC_NUM_LANES{1'b0}};
+    init_bit_slip           <= {NUM_LANES{1'b0}};
 
 
-    if(rf_hmc_sleep) begin
+    if(rf_hmc_sleep || !rf_hmc_init_cont_set) begin
         rf_link_status <= LINK_DOWN;
     end else if(rf_link_status == LINK_DOWN) begin
         //Begin (Re-)Init
-        descrambler_aligned         <= {HMC_NUM_LANES{1'b0}};
-        descrambler_part_aligned    <= {HMC_NUM_LANES{1'b0}};
-        init_bit_slip               <= {HMC_NUM_LANES{1'b0}};
+        descrambler_aligned         <= {NUM_LANES{1'b0}};
+        descrambler_part_aligned    <= {NUM_LANES{1'b0}};
+        init_bit_slip               <= {NUM_LANES{1'b0}};
         init_wait_time              <= 5'h1f;
         rf_hmc_init_status          <= HMC_DOWN;
         rf_link_status              <= LINK_INIT;
-        rf_lane_polarity            <= {HMC_NUM_LANES{1'b0}};
+        rf_lane_polarity            <= {NUM_LANES{1'b0}};
         rf_lane_reversal_detected   <= 1'b0;
-        rf_descramblers_locked      <= {HMC_NUM_LANES{1'b0}};
+        rf_descramblers_locked      <= {NUM_LANES{1'b0}};
         init_tmp_seq                <= 4'h0;
+        init_lane_cnt               <= {LOG_NUM_LANES{1'b0}};
     end
 
     //Detect Lane polarity when HMC is sending first NULLs
     if(&rf_descramblers_locked && rf_link_status == LINK_INIT) begin
-        for(i_f = 0;i_f<HMC_NUM_LANES;i_f=i_f+1)begin
+        for(i_f = 0;i_f<NUM_LANES;i_f=i_f+1)begin
             if(descrambled_data_on_lane[i_f] == {WIDTH_PER_LANE{1'b1}})begin
                 rf_lane_polarity[i_f] <=  1'b1;
             end
         end
     end
 
-
-    if(rf_hmc_init_status == HMC_DOWN && &rf_descramblers_locked && !valid_flit_src_init) begin
-        rf_hmc_init_status <= HMC_NULL;
+    if((rf_hmc_init_status == HMC_DOWN) && &rf_descramblers_locked) begin
+        if(!valid_flit_src)
+            rf_hmc_init_status <= HMC_NULL;
     end
 
     //When TX block sends ts1, start init process
-    if(rf_tx_sends_ts1 && &valid_flit_src_init) begin
+    if(rf_tx_sends_ts1 && &valid_flit_src) begin
         rf_hmc_init_status      <= HMC_TS1;
     end
 
@@ -480,8 +493,8 @@ else begin
                     init_lane_cnt        <= init_lane_cnt + 1;
 
                     if(~&descrambler_part_aligned) begin
-                        if(!descrambler_part_aligned[init_lane_cnt])begin
-                            descrambler_part_aligned[init_lane_cnt]          <= init_lane_has_correct_ts1[init_lane_cnt];
+                        descrambler_part_aligned[init_lane_cnt]          <= init_lane_has_correct_ts1[init_lane_cnt];
+                        if(!descrambler_part_aligned[init_lane_cnt])begin     
                             init_bit_slip[init_lane_cnt]                     <= ~init_lane_has_correct_ts1[init_lane_cnt];
                             if(init_seq_diff < INIT_SEQ_INC_PER_CYCLE && init_lane_has_correct_ts1[init_lane_cnt]) begin
                                 init_tmp_seq                            <= descrambled_data_on_lane[init_lane_cnt][3:0] + INIT_SEQ_INC_PER_CYCLE;
@@ -495,7 +508,7 @@ else begin
                         end
                     end
 
-                    if(init_lane_cnt == HMC_NUM_LANES-1)begin
+                    if(init_lane_cnt == NUM_LANES-1)begin
                         init_bit_slip_cnt <= rf_bit_slip_time;
                     end
 
@@ -515,7 +528,7 @@ else begin
             end
 
             //when received NULLs again, init done (initial TRETs are treated as normal packets)
-            if(valid_flit_src_init == 0)begin
+            if(valid_flit_src == 0)begin
                 rf_link_status      <= LINK_UP;
                 rf_hmc_init_status  <= HMC_UP;
             end
@@ -527,27 +540,6 @@ end
 //========================================================================================================================================
 //------------------------------------------------------------------Packet Processing
 //========================================================================================================================================
-
-//==================================================================================
-//---------------------------------Register Input data after reordering and link_up
-//==================================================================================
-`ifdef ASYNC_RES
-always @(posedge clk or negedge res_n)  begin `else
-always @(posedge clk)  begin `endif
-if(!res_n) begin
-    d_in        <= {DWIDTH{1'b0}};
-    d_in_init   <= {DWIDTH{1'b0}};
-end else begin
-    if(link_is_up) begin
-        d_in        <= d_in_temp;
-        d_in_init   <= {DWIDTH{1'b0}};
-    end else begin
-        d_in        <= {DWIDTH{1'b0}};
-        d_in_init   <= d_in_temp;
-    end
-end
-end
-
 //==================================================================================
 //---------------------------------Detect HDR,Tail,Valid Flits and provide to CRC logic
 //==================================================================================
@@ -568,8 +560,8 @@ always @(*)  begin
         end
 
         if(data2crc_payload_remain_comb) begin
-            data2crc_valid_comb[i_f] = 1'b1;
-            data2crc_payload_remain_comb      = data2crc_payload_remain_comb - 1;
+            data2crc_valid_comb[i_f]     = 1'b1;
+            data2crc_payload_remain_comb = data2crc_payload_remain_comb - 1;
         end else if(valid_flit_src[i_f])begin
 
             data2crc_hdr_comb[i_f]   = 1'b1;
@@ -577,10 +569,10 @@ always @(*)  begin
 
             if(lng(d_in_flit[i_f]) < 2 || lng(d_in_flit[i_f]) > 9) begin
                 //Treat false lng values as single FLIT packets which will force error abort mode
-                data2crc_tail_comb[i_f]  = 1'b1;
-                data2crc_lng_per_flit_comb[i_f]   = 1;
+                data2crc_tail_comb[i_f]         = 1'b1;
+                data2crc_lng_per_flit_comb[i_f] = 1;
             end else begin
-                data2crc_payload_remain_comb             = lng(d_in_flit[i_f]) -1;
+                data2crc_payload_remain_comb    = lng(d_in_flit[i_f]) -1;
                 data2crc_lng_per_flit_comb[i_f] = lng(d_in_flit[i_f]);
             end
         end
@@ -607,9 +599,11 @@ if(!res_n) begin
     data2crc <= {DWIDTH{1'b0}};
 
 end else begin
-    data2crc_hdr    <= data2crc_hdr_comb;
-    data2crc_tail   <= data2crc_tail_comb;
-    data2crc_valid  <= data2crc_valid_comb;
+    if(link_is_up) begin
+        data2crc_hdr    <= data2crc_hdr_comb;
+        data2crc_tail   <= data2crc_tail_comb;
+        data2crc_valid  <= data2crc_valid_comb;
+    end
 
     data2crc_payload_remain  <= data2crc_payload_remain_comb;
 
@@ -617,7 +611,7 @@ end else begin
         data2crc_lng_per_flit[i_f] <= data2crc_lng_per_flit_comb[i_f];
     end
 
-    data2crc      <= d_in;
+    data2crc  <= d_in;
 
 end
 end
@@ -661,7 +655,6 @@ end else begin
             flit_after_lng_check_is_error[i_f]  <= 1'b1;
         end
     end
-
 end
 end
 
@@ -807,7 +800,7 @@ end else begin
 
     tx_error_abort_mode_cleared <= 1'b0;
 
-    if(irtry_clear_trig) begin
+    if(irtry_clear_trig /*|| !rf_hmc_init_cont_set*/) begin //TODO remove
         tx_error_abort_mode         <= 1'b0;
         tx_error_abort_mode_cleared <= 1'b1;
     end
@@ -1180,11 +1173,11 @@ end
 always @(posedge clk or negedge res_n)  begin `else
 always @(posedge clk)  begin `endif
 if(!res_n) begin
-    rf_cnt_poisoned <= {HMC_RF_WWIDTH{1'b0}};
-    rf_cnt_rsp      <= {HMC_RF_WWIDTH{1'b0}};
+    rf_cnt_poisoned <= {HMC_RF_RWIDTH{1'b0}};
+    rf_cnt_rsp      <= {HMC_RF_RWIDTH{1'b0}};
 end else begin
-    rf_cnt_poisoned <= rf_cnt_poisoned + {{HMC_RF_WWIDTH-LOG_FPW-1{1'b0}},rf_cnt_poisoned_comb};
-    rf_cnt_rsp      <= rf_cnt_rsp + {{HMC_RF_WWIDTH-LOG_FPW-1{1'b0}},rf_cnt_rsp_comb};
+    rf_cnt_poisoned <= rf_cnt_poisoned + {{HMC_RF_RWIDTH-LOG_FPW-1{1'b0}},rf_cnt_poisoned_comb};
+    rf_cnt_rsp      <= rf_cnt_rsp + {{HMC_RF_RWIDTH-LOG_FPW-1{1'b0}},rf_cnt_rsp_comb};
 end
 end
 
@@ -1243,15 +1236,15 @@ end
 //-----------------------------------------------------------------------------------------------------
 //=====================================================================================================
 
-wire res_n_lanes = (rf_link_status == LINK_DOWN) ? 0 : 1'b1 ;
+wire res_n_lanes = ((rf_link_status == LINK_DOWN) || !rf_hmc_init_cont_set) ? 0 : 1'b1 ;
 
 //Lane Init
 genvar i;
 generate
-for(i=0;i<HMC_NUM_LANES;i=i+1)begin : lane_gen
+for(i=0;i<NUM_LANES;i=i+1)begin : lane_gen
     rx_lane_logic #(
         .DWIDTH(DWIDTH),
-        .NUM_LANES(HMC_NUM_LANES)
+        .NUM_LANES(NUM_LANES)
     ) rx_lane_I (
         .clk(clk),
         .res_n(res_n_lanes),
@@ -1264,7 +1257,6 @@ for(i=0;i<HMC_NUM_LANES;i=i+1)begin : lane_gen
     );
 end
 endgenerate
-
 
 //HMC CRC Logic
 rx_crc_compare #(
@@ -1304,7 +1296,7 @@ sync_fifo #(
         .shift_in(input_buffer_shift_in),
         .d_out(input_buffer_d_out),
         .shift_out(input_buffer_shift_out),
-        .next_stage_full(1'b1), // Set to 1 if not chained
+        .next_stage_full(1'b1), // Dont touch!
         .empty(input_buffer_empty)
     );
 
